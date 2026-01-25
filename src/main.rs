@@ -31,6 +31,7 @@ enum Commands {
         #[arg(short = 's', long = "search")]
         search: Vec<String>,
     },
+    /// Execute a predefined workflow step
     Step {
         /// The name of the workflow step to execute
         #[arg(short = 's', required = true)]
@@ -41,8 +42,8 @@ enum Commands {
         workflow: String,
 
         /// Executes the step but skips the remoting to tmux
-        #[arg(short = 'h', default_value = "0")]
-        here: bool,
+        #[arg(short = 'l', default_value = "false")]
+        local: bool,
 
     }
 }
@@ -58,9 +59,10 @@ fn main() {
             args,
             search,
         } => {
-            execute_command_with_pty(&command, &args, &search)
+            // execute_command_with_pty(&command, &args, &search, )
+            Ok(())
         },
-        cmd @Commands::Step { .. } => run_step(&cmd)
+        cmd @Commands::Step { .. } => cli_run_step(&cmd)
     };
 
     match r {
@@ -83,16 +85,39 @@ fn load_config<T: DeserializeOwned>(name: &str) -> anyhow::Result<T> {
     Ok(workflow)
 }
 
-fn run_step(c: &Commands) -> anyhow::Result<()> {
-    let Commands::Step { name, workflow, here } = c else { panic!("was matched against step but isnt") };
-    let w: cfg::Workflow = load_config::<cfg::Workflow>(&workflow)?;
-    let step = w.steps.iter().find(|s| s.name == *name)
-        .ok_or_else(|| anyhow::anyhow!("Step '{}' not found in workflow", name))?;
-
-    Ok(())
+fn cli_run_step(c: &Commands) -> anyhow::Result<()> {
+    let Commands::Step { name, workflow, local } = c else { panic!("was matched against step but isnt") };
+    let w: cfg::Workflow = load_config::<cfg::Workflow>(&format!("{}.yaml", workflow))?;
+    let app = cfg::AppObj {
+        workflow: w,
+        workflow_name: workflow.clone(),
+    };
+    run_step_by_name(name, *local, &app)
 }
 
-fn execute_command_with_pty(command: &str, args: &[String], search: &[String]) -> anyhow::Result<()> {
+fn run_step_by_name(name: &str, local: bool, app: &cfg::AppObj) -> anyhow::Result<()> {
+    let step = app.workflow.steps.iter().find(|s| s.name == *name)
+        .ok_or_else(|| anyhow::anyhow!("Step '{}' not found in workflow", name))?;
+
+    // Check if we should remote to tmux
+    if let Some(tmux_opt) = &step.tmux {
+        if !local {
+            // Remote execution via tmux
+            let target = format!("{}:{}", tmux_opt.sess, tmux_opt.win);
+
+            tmux::careful_run_command(&target, &format!("ft step -l -w {} -s {name}", app.workflow_name), tmux_opt.fish_vi_mode)?;
+            //tmux::careful_run_command(&target, &step.command, tmux_opt.fish_vi_mode)?;
+
+            return Ok(());
+        }
+    }
+
+    // Local execution through shell
+    // Run the command through /bin/sh -c to handle shell syntax
+    execute_command_with_pty("/bin/sh", &["-c".to_string(), step.command.clone()], &step,  &app)
+}
+
+fn execute_command_with_pty(command: &str, args: &[String], step: &cfg::WorkflowStep, app: &cfg::AppObj) -> anyhow::Result<()> {
     let pty_system = native_pty_system();
 
     // Detect terminal size, fall back to defaults if detection fails
@@ -137,6 +162,7 @@ fn execute_command_with_pty(command: &str, args: &[String], search: &[String]) -
     let mut reader = pair.master.try_clone_reader().unwrap();
     let mut buffer = [0u8; 1024];
     let mut captured_output = Vec::new();
+    let mut state: Option<cfg::Impulse> = None;
 
     // Stream output in real-time and capture for searching
     loop {
@@ -145,10 +171,15 @@ fn execute_command_with_pty(command: &str, args: &[String], search: &[String]) -
             Ok(n) => {
                 //println!(">> {} bytes", n);
                 // Capture output for searching
-                if !search.is_empty() {
-                    let stripped = strip_ansi_escapes::strip(&buffer[..n]);
-                    captured_output.extend_from_slice(&stripped);
-                    search_output(&captured_output, search);
+                let stripped = strip_ansi_escapes::strip(&buffer[..n]);
+                captured_output.extend_from_slice(&stripped);
+
+
+                // only search and take action if we haven't already
+                if state.is_none() {
+                    if let Some(i) = search_output(&captured_output, step, app) {
+                        state = Some(i)
+                    }
                 }
 
                 // Print immediately as data arrives
@@ -176,26 +207,38 @@ fn execute_command_with_pty(command: &str, args: &[String], search: &[String]) -
     Ok(())
 }
 
-fn search_output(output: &[u8], search_terms: &[String]) {
-    let stripped_str = String::from_utf8_lossy(&output);
-
-    println!("\n{}", "=".repeat(60));
-    println!("Search results:");
-    println!("{}", "=".repeat(60));
-
-    let mut found_any = false;
-    for term in search_terms {
-        let pstart = (stripped_str.len() as i64 - (term.len() as i64 * 2)).max(0) as usize;
-        let count = stripped_str[pstart..].matches(term.as_str()).count();
-        if count > 0 {
-            println!("  '{}': found {} time(s)", term, count);
-            found_any = true;
-        } else {
-            println!("  '{}': not found", term);
+fn search_output(output: &[u8], step: &cfg::WorkflowStep, app: &cfg::AppObj) -> Option<cfg::Impulse> {
+    if let Some(scan_err) = &step.scan_err {
+        if search_output_one(output, scan_err) {
+            return Some(cfg::Impulse::Error);
         }
     }
+    if search_output_one(output, &step.scan_ok) {
+        return Some(cfg::Impulse::Success);
+    }
+    return None;
+}
 
-    if !found_any {
-        println!("  No search terms were found in the output");
+fn search_output_one(output: &[u8], term: &str) -> bool {
+    let pstart = (output.len() as i64 - (term.len() as i64 * 2)).max(0) as usize;
+    let stripped_str = String::from_utf8_lossy(&output[pstart..]);
+    let count = stripped_str.matches(term).count();
+    return count > 0;
+}
+
+fn take_action(from: &cfg::WorkflowStep, impulse: &cfg::Impulse, app: &cfg::AppObj) -> anyhow::Result<()> {
+    match impulse {
+        cfg::Impulse::Success => {
+            from.links.as_ref()
+                .and_then(|l| l.on_ok.as_ref())
+                .and_then(|s| Some(run_step_by_name(s, false, app)))
+                .unwrap_or(Ok(()))
+        }
+        cfg::Impulse::Error => {
+            from.links.as_ref()
+                .and_then(|l| l.on_err.as_ref())
+                .and_then(|s| Some(run_step_by_name(s, false, app)))
+                .unwrap_or(Ok(()))
+        }
     }
 }

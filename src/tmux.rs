@@ -30,3 +30,14 @@ pub fn tmux(args: &[&str]) -> Result<std::process::ExitStatus, std::io::Error> {
 pub fn tmux_send_keys(target: &str, keys: &str) -> Result<std::process::ExitStatus, std::io::Error> {
     tmux(&["send-keys", "-t", target, keys])
 }
+
+pub fn careful_run_command(target: &str, cmd: &str, fish_vim_mode: bool) -> anyhow::Result<()> {
+    // cancel copy mode if any
+    tmux(&["send-keys", "-t", target, "-X", "cancel"])?;
+    // Send the command
+    tmux_send_keys(target, cmd)?;
+    // Send Enter to execute
+    tmux_send_keys(target, "Enter")?;
+
+    Ok(())
+}
