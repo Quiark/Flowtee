@@ -9,6 +9,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "portable-pty",
  "serde",
  "serde_yaml",

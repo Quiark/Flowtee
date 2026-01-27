@@ -1,11 +1,51 @@
-mod tmux;
 mod cfg;
+mod tmux;
 
 use clap::{Parser, Subcommand};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::de::DeserializeOwned;
 use std::io::Read;
-use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+static RUNNING_PGIDS: OnceLock<Mutex<Vec<i32>>> = OnceLock::new();
+
+fn running_pgids() -> &'static Mutex<Vec<i32>> {
+    RUNNING_PGIDS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(unix)]
+fn kill_process_group(pgid: i32) {
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+}
+
+fn terminate_all(exit_code: i32) -> ! {
+    let pgids = running_pgids().lock().unwrap().clone();
+    for pgid in pgids {
+        #[cfg(unix)]
+        {
+            kill_process_group(pgid);
+        }
+    }
+
+    std::process::exit(exit_code)
+}
+
+enum LinkAction<'a> {
+    Step(&'a str),
+    End,
+}
+
+fn resolve_link_action(link: &cfg::WorkflowLink) -> LinkAction<'_> {
+    match link {
+        cfg::WorkflowLink::StepName(s) => LinkAction::Step(s.as_str()),
+        cfg::WorkflowLink::Typed(cfg::WorkflowLinkTyped::Step { step }) => {
+            LinkAction::Step(step.as_str())
+        }
+        cfg::WorkflowLink::Typed(cfg::WorkflowLinkTyped::End) => LinkAction::End,
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "flowtee")]
@@ -44,8 +84,7 @@ enum Commands {
         /// Executes the step but skips the remoting to tmux
         #[arg(short = 'l', default_value = "false")]
         local: bool,
-
-    }
+    },
 }
 
 fn main() {
@@ -61,8 +100,8 @@ fn main() {
         } => {
             // execute_command_with_pty(&command, &args, &search, )
             Ok(())
-        },
-        cmd @Commands::Step { .. } => cli_run_step(&cmd)
+        }
+        cmd @ Commands::Step { .. } => cli_run_step(&cmd),
     };
 
     match r {
@@ -80,13 +119,22 @@ fn load_config<T: DeserializeOwned>(name: &str) -> anyhow::Result<T> {
         .join(".config")
         .join("flowtee")
         .join(name);
-    let workflow: T = serde_yaml::from_reader(std::fs::File::open(cfg_path)? /*("Failed to open config file")*/)?;
-        //.expect("Failed to parse config file");
+    let workflow: T = serde_yaml::from_reader(
+        std::fs::File::open(cfg_path)?, /*("Failed to open config file")*/
+    )?;
+    //.expect("Failed to parse config file");
     Ok(workflow)
 }
 
 fn cli_run_step(c: &Commands) -> anyhow::Result<()> {
-    let Commands::Step { name, workflow, local } = c else { panic!("was matched against step but isnt") };
+    let Commands::Step {
+        name,
+        workflow,
+        local,
+    } = c
+    else {
+        panic!("was matched against step but isnt")
+    };
     let w: cfg::Workflow = load_config::<cfg::Workflow>(&format!("{}.yaml", workflow))?;
     let app = cfg::AppObj {
         workflow: w,
@@ -96,7 +144,11 @@ fn cli_run_step(c: &Commands) -> anyhow::Result<()> {
 }
 
 fn run_step_by_name(name: &str, local: bool, app: &cfg::AppObj) -> anyhow::Result<()> {
-    let step = app.workflow.steps.iter().find(|s| s.name == *name)
+    let step = app
+        .workflow
+        .steps
+        .iter()
+        .find(|s| s.name == *name)
         .ok_or_else(|| anyhow::anyhow!("Step '{}' not found in workflow", name))?;
 
     // Check if we should remote to tmux
@@ -105,7 +157,11 @@ fn run_step_by_name(name: &str, local: bool, app: &cfg::AppObj) -> anyhow::Resul
             // Remote execution via tmux
             let target = format!("{}:{}", tmux_opt.sess, tmux_opt.win);
 
-            tmux::careful_run_command(&target, &format!("ft step -l -w {} -s {name}", app.workflow_name), tmux_opt.fish_vi_mode)?;
+            tmux::careful_run_command(
+                &target,
+                &format!("ft step -l -w {} -s {name}", app.workflow_name),
+                tmux_opt.fish_vi_mode,
+            )?;
             //tmux::careful_run_command(&target, &step.command, tmux_opt.fish_vi_mode)?;
 
             return Ok(());
@@ -114,10 +170,20 @@ fn run_step_by_name(name: &str, local: bool, app: &cfg::AppObj) -> anyhow::Resul
 
     // Local execution through shell
     // Run the command through /bin/sh -c to handle shell syntax
-    execute_command_with_pty("/bin/sh", &["-c".to_string(), step.command.clone()], &step,  &app)
+    execute_command_with_pty(
+        "/bin/sh",
+        &["-c".to_string(), step.command.clone()],
+        &step,
+        &app,
+    )
 }
 
-fn execute_command_with_pty(command: &str, args: &[String], step: &cfg::WorkflowStep, app: &cfg::AppObj) -> anyhow::Result<()> {
+fn execute_command_with_pty(
+    command: &str,
+    args: &[String],
+    step: &cfg::WorkflowStep,
+    app: &cfg::AppObj,
+) -> anyhow::Result<()> {
     let pty_system = native_pty_system();
 
     // Detect terminal size, fall back to defaults if detection fails
@@ -143,8 +209,10 @@ fn execute_command_with_pty(command: &str, args: &[String], step: &cfg::Workflow
     let mut cmd = CommandBuilder::new(command);
     cmd.args(args);
 
-    // Preserve current working directory
-    if let Ok(cwd) = std::env::current_dir() {
+    // Preserve current working directory (or override per-step)
+    if let Some(pwd) = &step.pwd {
+        cmd.cwd(pwd);
+    } else if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
 
@@ -156,13 +224,20 @@ fn execute_command_with_pty(command: &str, args: &[String], step: &cfg::Workflow
         }
     };
 
+    // Track process group so `type: end` can terminate everything.
+    #[cfg(unix)]
+    if let Some(pgid) = pair.master.process_group_leader() {
+        running_pgids().lock().unwrap().push(pgid);
+    }
+
     // Drop the slave to avoid deadlock
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().unwrap();
     let mut buffer = [0u8; 1024];
     let mut captured_output = Vec::new();
-    let mut state: Option<cfg::Impulse> = None;
+    let mut scan_state: Option<cfg::Impulse> = None;
+    let mut scan_action_taken = false;
 
     // Stream output in real-time and capture for searching
     loop {
@@ -174,11 +249,17 @@ fn execute_command_with_pty(command: &str, args: &[String], step: &cfg::Workflow
                 let stripped = strip_ansi_escapes::strip(&buffer[..n]);
                 captured_output.extend_from_slice(&stripped);
 
+                // Scan match is independent from exit status.
+                if scan_state.is_none() {
+                    if let Some(event) = search_output(&captured_output, step) {
+                        scan_state = Some(event);
+                    }
+                }
 
-                // only search and take action if we haven't already
-                if state.is_none() {
-                    if let Some(i) = search_output(&captured_output, step, app) {
-                        state = Some(i)
+                if !scan_action_taken {
+                    if let Some(event) = scan_state {
+                        take_action(step, &event, app)?;
+                        scan_action_taken = true;
                     }
                 }
 
@@ -204,19 +285,41 @@ fn execute_command_with_pty(command: &str, args: &[String], step: &cfg::Workflow
             std::process::exit(1);
         }
     };
+
+    if let Some(outputs) = &step.outputs {
+        if let Some(stdout_path) = &outputs.stdout {
+            std::fs::write(stdout_path, &captured_output)?;
+        }
+        if let Some(stderr_path) = &outputs.stderr {
+            // Best-effort: PTY merges streams; write same capture.
+            std::fs::write(stderr_path, &captured_output)?;
+        }
+    }
+
+    let exit_event = if status.success() {
+        cfg::Impulse::ExitOk
+    } else {
+        cfg::Impulse::ExitErr
+    };
+    take_action(step, &exit_event, app)?;
+
     Ok(())
 }
 
-fn search_output(output: &[u8], step: &cfg::WorkflowStep, app: &cfg::AppObj) -> Option<cfg::Impulse> {
+fn search_output(output: &[u8], step: &cfg::WorkflowStep) -> Option<cfg::Impulse> {
     if let Some(scan_err) = &step.scan_err {
         if search_output_one(output, scan_err) {
-            return Some(cfg::Impulse::Error);
+            return Some(cfg::Impulse::ScanErr);
         }
     }
-    if search_output_one(output, &step.scan_ok) {
-        return Some(cfg::Impulse::Success);
+
+    if let Some(scan_ok) = &step.scan_ok {
+        if search_output_one(output, scan_ok) {
+            return Some(cfg::Impulse::ScanOk);
+        }
     }
-    return None;
+
+    None
 }
 
 fn search_output_one(output: &[u8], term: &str) -> bool {
@@ -226,19 +329,45 @@ fn search_output_one(output: &[u8], term: &str) -> bool {
     return count > 0;
 }
 
-fn take_action(from: &cfg::WorkflowStep, impulse: &cfg::Impulse, app: &cfg::AppObj) -> anyhow::Result<()> {
-    match impulse {
-        cfg::Impulse::Success => {
-            from.links.as_ref()
-                .and_then(|l| l.on_ok.as_ref())
-                .and_then(|s| Some(run_step_by_name(s, false, app)))
-                .unwrap_or(Ok(()))
-        }
-        cfg::Impulse::Error => {
-            from.links.as_ref()
-                .and_then(|l| l.on_err.as_ref())
-                .and_then(|s| Some(run_step_by_name(s, false, app)))
-                .unwrap_or(Ok(()))
+fn take_action(
+    from: &cfg::WorkflowStep,
+    impulse: &cfg::Impulse,
+    app: &cfg::AppObj,
+) -> anyhow::Result<()> {
+    let links = from.links.as_ref();
+
+    let link = match impulse {
+        cfg::Impulse::ScanOk => links
+            .and_then(|l| l.on_scan_ok.as_ref())
+            .or_else(|| links.and_then(|l| l.on_ok.as_ref())),
+        cfg::Impulse::ScanErr => links
+            .and_then(|l| l.on_scan_err.as_ref())
+            .or_else(|| links.and_then(|l| l.on_err.as_ref())),
+        cfg::Impulse::ExitOk => links
+            .and_then(|l| l.on_exit_ok.as_ref())
+            .or_else(|| links.and_then(|l| l.on_ok.as_ref())),
+        cfg::Impulse::ExitErr => links
+            .and_then(|l| l.on_exit_err.as_ref())
+            .or_else(|| links.and_then(|l| l.on_err.as_ref())),
+    };
+
+    let Some(link) = link else {
+        return Ok(());
+    };
+
+    if from.final_step.unwrap_or(false) {
+        return Ok(());
+    }
+
+    match resolve_link_action(link) {
+        LinkAction::Step(step_name) => run_step_by_name(step_name, false, app),
+        LinkAction::End => {
+            // Kill workflow processes and exit.
+            let code = match impulse {
+                cfg::Impulse::ExitErr | cfg::Impulse::ScanErr => 1,
+                cfg::Impulse::ExitOk | cfg::Impulse::ScanOk => 0,
+            };
+            terminate_all(code)
         }
     }
 }

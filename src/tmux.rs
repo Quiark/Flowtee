@@ -27,7 +27,10 @@ pub fn tmux(args: &[&str]) -> Result<std::process::ExitStatus, std::io::Error> {
 ///
 /// # Returns
 /// Result containing the exit status
-pub fn tmux_send_keys(target: &str, keys: &str) -> Result<std::process::ExitStatus, std::io::Error> {
+pub fn tmux_send_keys(
+    target: &str,
+    keys: &str,
+) -> Result<std::process::ExitStatus, std::io::Error> {
     tmux(&["send-keys", "-t", target, keys])
 }
 
