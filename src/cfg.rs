@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TmuxOpt {
@@ -10,10 +11,7 @@ pub struct TmuxOpt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowOutputs {
-    #[serde(default)]
-    pub stdout: Option<String>,
-    #[serde(default)]
-    pub stderr: Option<String>,
+    pub file: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +61,9 @@ pub struct WorkflowStep {
     pub outputs: Option<WorkflowOutputs>,
 
     #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+
+    #[serde(default)]
     pub tmux: Option<TmuxOpt>,
     #[serde(default)]
     pub links: Option<WorkflowLinks>,
@@ -76,6 +77,7 @@ pub struct Workflow {
     pub steps: Vec<WorkflowStep>,
 }
 
+#[derive(Clone)]
 pub struct AppObj {
     pub workflow: Workflow,
     pub workflow_name: String,

@@ -84,6 +84,10 @@ enum Commands {
         /// Executes the step but skips the remoting to tmux
         #[arg(short = 'l', default_value = "false")]
         local: bool,
+
+        /// Path to a custom YAML file (overrides workflow name)
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
     },
 }
 
@@ -126,16 +130,30 @@ fn load_config<T: DeserializeOwned>(name: &str) -> anyhow::Result<T> {
     Ok(workflow)
 }
 
+fn load_config_from_path<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+    let workflow: T = serde_yaml::from_reader(
+        std::fs::File::open(path)?,
+    )?;
+    Ok(workflow)
+}
+
 fn cli_run_step(c: &Commands) -> anyhow::Result<()> {
     let Commands::Step {
         name,
         workflow,
         local,
+        file,
     } = c
     else {
         panic!("was matched against step but isnt")
     };
-    let w: cfg::Workflow = load_config::<cfg::Workflow>(&format!("{}.yaml", workflow))?;
+    
+    let w: cfg::Workflow = if let Some(file_path) = file {
+        load_config_from_path::<cfg::Workflow>(file_path)?
+    } else {
+        load_config::<cfg::Workflow>(&format!("{}.yaml", workflow))?
+    };
+    
     let app = cfg::AppObj {
         workflow: w,
         workflow_name: workflow.clone(),
@@ -216,6 +234,13 @@ fn execute_command_with_pty(
         cmd.cwd(cwd);
     }
 
+    // Apply environment variables from step config
+    if let Some(env_vars) = &step.env {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
+
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(e) => {
@@ -239,6 +264,12 @@ fn execute_command_with_pty(
     let mut scan_state: Option<cfg::Impulse> = None;
     let mut scan_action_taken = false;
 
+    let mut output_file = if let Some(outputs) = &step.outputs {
+        Some(std::fs::File::create(&outputs.file)?)
+    } else {
+        None
+    };
+
     // Stream output in real-time and capture for searching
     loop {
         match reader.read(&mut buffer) {
@@ -249,6 +280,12 @@ fn execute_command_with_pty(
                 let stripped = strip_ansi_escapes::strip(&buffer[..n]);
                 captured_output.extend_from_slice(&stripped);
 
+                use std::io::Write;
+                if let Some(ref mut file) = output_file {
+                    file.write_all(&stripped)?;
+                    file.flush()?;
+                }
+
                 // Scan match is independent from exit status.
                 if scan_state.is_none() {
                     if let Some(event) = search_output(&captured_output, step) {
@@ -258,14 +295,13 @@ fn execute_command_with_pty(
 
                 if !scan_action_taken {
                     if let Some(event) = scan_state {
-                        take_action(step, &event, app)?;
+                        take_action_async(step, &event, app)?;
                         scan_action_taken = true;
                     }
                 }
 
                 // Print immediately as data arrives
-                print!("{}", String::from_utf8_lossy(&buffer[..n]));
-                use std::io::Write;
+                print!("{}", add_to_each_line(&format!("{}| ", step.name), &String::from_utf8_lossy(&buffer[..n])));
                 std::io::stdout().flush().unwrap();
             }
             Err(e) => {
@@ -286,16 +322,6 @@ fn execute_command_with_pty(
         }
     };
 
-    if let Some(outputs) = &step.outputs {
-        if let Some(stdout_path) = &outputs.stdout {
-            std::fs::write(stdout_path, &captured_output)?;
-        }
-        if let Some(stderr_path) = &outputs.stderr {
-            // Best-effort: PTY merges streams; write same capture.
-            std::fs::write(stderr_path, &captured_output)?;
-        }
-    }
-
     let exit_event = if status.success() {
         cfg::Impulse::ExitOk
     } else {
@@ -304,6 +330,14 @@ fn execute_command_with_pty(
     take_action(step, &exit_event, app)?;
 
     Ok(())
+}
+
+fn add_to_each_line(prefix: &str, text: &str) -> String {
+    text.replace("\n", &format!("\n{}", prefix))
+    //text.lines()
+    //    .map(|line| format!("{}{}", prefix, line))
+    //    .collect::<Vec<String>>()
+    //    .join("\n")
 }
 
 fn search_output(output: &[u8], step: &cfg::WorkflowStep) -> Option<cfg::Impulse> {
@@ -327,6 +361,57 @@ fn search_output_one(output: &[u8], term: &str) -> bool {
     let stripped_str = String::from_utf8_lossy(&output[pstart..]);
     let count = stripped_str.matches(term).count();
     return count > 0;
+}
+
+fn take_action_async(
+    from: &cfg::WorkflowStep,
+    impulse: &cfg::Impulse,
+    app: &cfg::AppObj,
+) -> anyhow::Result<()> {
+    let links = from.links.as_ref();
+
+    let link = match impulse {
+        cfg::Impulse::ScanOk => links
+            .and_then(|l| l.on_scan_ok.as_ref())
+            .or_else(|| links.and_then(|l| l.on_ok.as_ref())),
+        cfg::Impulse::ScanErr => links
+            .and_then(|l| l.on_scan_err.as_ref())
+            .or_else(|| links.and_then(|l| l.on_err.as_ref())),
+        cfg::Impulse::ExitOk => links
+            .and_then(|l| l.on_exit_ok.as_ref())
+            .or_else(|| links.and_then(|l| l.on_ok.as_ref())),
+        cfg::Impulse::ExitErr => links
+            .and_then(|l| l.on_exit_err.as_ref())
+            .or_else(|| links.and_then(|l| l.on_err.as_ref())),
+    };
+
+    let Some(link) = link else {
+        return Ok(());
+    };
+
+    if from.final_step.unwrap_or(false) {
+        return Ok(());
+    }
+
+    match resolve_link_action(link) {
+        LinkAction::Step(step_name) => {
+            let step_name = step_name.to_string();
+            let app_clone = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = run_step_by_name(&step_name, false, &app_clone) {
+                    eprintln!("Error running step {}: {}", step_name, e);
+                }
+            });
+            Ok(())
+        }
+        LinkAction::End => {
+            let code = match impulse {
+                cfg::Impulse::ExitErr | cfg::Impulse::ScanErr => 1,
+                cfg::Impulse::ExitOk | cfg::Impulse::ScanOk => 0,
+            };
+            terminate_all(code)
+        }
+    }
 }
 
 fn take_action(
@@ -362,7 +447,6 @@ fn take_action(
     match resolve_link_action(link) {
         LinkAction::Step(step_name) => run_step_by_name(step_name, false, app),
         LinkAction::End => {
-            // Kill workflow processes and exit.
             let code = match impulse {
                 cfg::Impulse::ExitErr | cfg::Impulse::ScanErr => 1,
                 cfg::Impulse::ExitOk | cfg::Impulse::ScanOk => 0,
